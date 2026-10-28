@@ -38,7 +38,8 @@ Useful options (`./ocrpdf.py -h` lists them all):
 | `--lang en-US --lang de-DE` | OCR languages (default: auto-detect); `--list-languages` shows them |
 | `--jobs 4` | pages OCR'd in parallel |
 | `--cache-dir DIR`, `--no-cache` | where OCR results are cached (default `<outdir>/.ocr-cache`) |
-| `--dpi 300` | render resolution for OCR and figure crops |
+| `--dpi 300` | render resolution for OCR (lower values cost accuracy) |
+| `--image-dpi 200`, `--jpeg-quality 75` | figure image resolution and quality (see below) |
 | `--fast` | Vision's faster, less accurate recogniser |
 | `--figures auto\|embedded\|ink\|none` | how figures are found (see below) |
 | `--tables auto\|markdown\|image\|text` | text tables: Markdown tables when the text layer has clear columns, else images (default `auto`) |
@@ -69,8 +70,8 @@ Useful options (`./ocrpdf.py -h` lists them all):
    - *Tables set as text* (rows of separate short cells) become Markdown
      tables when their columns are clear in the text layer, otherwise
      images.
-   - Each figure is cropped from the render as a JPEG; text inside it is
-     dropped.
+   - Each figure is cropped as a JPEG from a render at `--image-dpi`;
+     text inside it is dropped.
 3. **Reading order**: recursive XY-cut over lines and figures (columns first,
    then horizontal bands), so multi-column layouts read correctly and figures
    land between the right paragraphs.
@@ -100,6 +101,23 @@ Useful options (`./ocrpdf.py -h` lists them all):
    - Chapters and numbered sections get anchors too (`#chap-4`, `#sec-2-1`).
    - Mentions like "see figure 3.9" or "chapter 4" become links to them,
      which pandoc keeps working across the EPUB's chapter files.
+
+## Image size
+
+Figures are rendered at `--image-dpi` (default 200) and saved at
+`--jpeg-quality` (default 75), independently of the 300 dpi used for OCR.
+Common e-readers are about 1070–1270 pixels wide, and 200 dpi makes a
+full-width figure from a 6-inch-wide book about 1150 px wide. On a 330-page
+book with 140 figures, the images take:
+
+| `--image-dpi` | quality 85 | quality 75 | quality 65 |
+|---|---:|---:|---:|
+| 300 | 16.9 MB | 13.7 MB | 11.9 MB |
+| 200 | 8.9 MB | 7.2 MB | 6.3 MB |
+| 150 | 5.9 MB | 4.8 MB | 4.2 MB |
+
+`--image-dpi 150 --jpeg-quality 65` is the smallest that keeps diagram labels
+readable; use 300 if the EPUB is mainly for tablets or zooming.
 
 ## Limitations
 

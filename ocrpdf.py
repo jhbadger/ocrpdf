@@ -966,8 +966,13 @@ def finish_page(
     boxes.sort(key=lambda b: (b.y0, b.x0))
 
     if boxes:
-        pix = prep.get_pix(args.dpi)
-        img = get_img()
+        # Figures are cropped from their own render at --image-dpi (sized for
+        # e-reader screens), independent of the OCR resolution.
+        if args.image_dpi == args.dpi:
+            pix = prep.get_pix(args.dpi)
+        else:
+            pix = page.get_pixmap(dpi=args.image_dpi, colorspace=pymupdf.csRGB, alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         kx, ky = pix.width / pw, pix.height / ph
     for i, fb in enumerate(boxes, 1):
         crop = img.crop(
@@ -1668,7 +1673,10 @@ def main(argv: list[str] | None = None) -> int:
         help="use the PDF's own text instead of OCR: auto = when a page has usable text and is not a scan "
         "(default); always = whenever there is any; never = always OCR",
     )
-    ap.add_argument("--dpi", type=int, default=300, help="render resolution for OCR and figures (default 300)")
+    ap.add_argument("--dpi", type=int, default=300, help="render resolution for OCR (default 300)")
+    ap.add_argument(
+        "--image-dpi", type=int, default=200, help="resolution of figure images (default 200, about e-reader width)"
+    )
     ap.add_argument(
         "--lang",
         action="append",
@@ -1701,7 +1709,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-contents", action="store_true", help="keep table-of-contents pages")
     ap.add_argument("--keep-figure-text", action="store_true", help="also emit text found inside figures")
     ap.add_argument("--keep-headers", action="store_true", help="keep running headers, footers and page numbers")
-    ap.add_argument("--jpeg-quality", type=int, default=85)
+    ap.add_argument("--jpeg-quality", type=int, default=75, help="JPEG quality of figure images (default 75)")
     ap.add_argument("--inline-images", action="store_true", help="embed JPEGs as base64 data URIs in the Markdown")
     ap.add_argument("--page-markers", action="store_true", help="insert <!-- page N --> comments")
     ap.add_argument("--no-front-matter", action="store_true", help="omit the YAML title/author block")
