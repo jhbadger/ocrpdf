@@ -1,3 +1,7 @@
 .claude/
 __pycache__/
 *.pyc
+# Input books and generated output stay out of the repository.
+*.pdf
+*.epub
+out/
