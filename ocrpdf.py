@@ -153,6 +153,7 @@ class Figure:
 class Table:
     box: Box
     md: str  # pipe table
+    notes: str = ""  # table footnotes (Markdown)
 
 
 @dataclass
@@ -346,13 +347,17 @@ def styled_md(groups: list[list]) -> str:
 
 
 def text_layer_lines(page: pymupdf.Page) -> list[Line]:
+    """The page's text lines with style, from the PDF text layer.
+
+    A PDF "line" is split where its pieces are far apart (more than 1.5x the
+    font size): labels side by side in a diagram, or the cells of a table row.
+    """
     flags = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_LIGATURES & ~pymupdf.TEXT_PRESERVE_IMAGES
     lines: list[Line] = []
     for block in page.get_text("dict", flags=flags)["blocks"]:
         for ln in block.get("lines", []):
             if abs(ln["dir"][1]) > 0.05:  # rotated text: axis labels and the like
                 continue
-            groups: list[list] = []
             sizes: Counter[float] = Counter()
             for s in ln["spans"]:
                 sizes[round(s["size"], 1)] += len(s["text"].strip())
@@ -360,41 +365,55 @@ def text_layer_lines(page: pymupdf.Page) -> list[Line]:
                 continue
             main_size = sizes.most_common(1)[0][0]
             baseline = statistics.median(s["origin"][1] for s in ln["spans"] if s["size"] >= 0.9 * main_size)
-            prev_x1 = None
+
+            chunks: list[list[dict]] = [[]]
+            last_x1 = None
             for s in ln["spans"]:
-                t = clean_text(s["text"])
-                if not t:
+                if s["text"].strip():
+                    if last_x1 is not None and s["bbox"][0] - last_x1 > 1.5 * main_size:
+                        chunks.append([])
+                    last_x1 = s["bbox"][2]
+                chunks[-1].append(s)
+
+            for chunk in chunks:
+                groups: list[list] = []
+                prev_x1 = None
+                for s in chunk:
+                    t = clean_text(s["text"])
+                    if not t:
+                        continue
+                    style = span_style(s, main_size, baseline)
+                    if not t.strip() and groups:
+                        style = groups[-1][1]
+                    if (
+                        prev_x1 is not None
+                        and s["bbox"][0] - prev_x1 > 0.15 * s["size"]
+                        and not groups[-1][0].endswith(" ")
+                        and not t.startswith(" ")
+                    ):
+                        t = " " + t
+                    if groups and groups[-1][1] == style:
+                        groups[-1][0] += t
+                    else:
+                        groups.append([t, style])
+                    prev_x1 = s["bbox"][2]
+                text = "".join(g[0] for g in groups).strip()
+                if not text:
                     continue
-                style = span_style(s, main_size, baseline)
-                if not t.strip() and groups:
-                    style = groups[-1][1]
-                if (
-                    prev_x1 is not None
-                    and s["bbox"][0] - prev_x1 > 0.15 * s["size"]
-                    and not groups[-1][0].endswith(" ")
-                    and not t.startswith(" ")
-                ):
-                    t = " " + t
-                if groups and groups[-1][1] == style:
-                    groups[-1][0] += t
-                else:
-                    groups.append([t, style])
-                prev_x1 = s["bbox"][2]
-            text = "".join(g[0] for g in groups).strip()
-            if not text:
-                continue
-            inked = [g for g in groups if g[0].strip()]
-            lines.append(
-                Line(
-                    text,
-                    1.0,
-                    _rotated(pymupdf.Rect(ln["bbox"]), page),
-                    md=styled_md(groups).strip(),
-                    size=main_size,
-                    bold=all(g[1][0] for g in inked),
-                    mono=all(g[1][2] for g in inked),
+                inked = [g for g in groups if g[0].strip()]
+                ink = [s["bbox"] for s in chunk if s["text"].strip()]
+                rect = pymupdf.Rect(min(b[0] for b in ink), ln["bbox"][1], max(b[2] for b in ink), ln["bbox"][3])
+                lines.append(
+                    Line(
+                        text,
+                        1.0,
+                        _rotated(rect, page),
+                        md=styled_md(groups).strip(),
+                        size=main_size,
+                        bold=all(g[1][0] for g in inked),
+                        mono=all(g[1][2] for g in inked),
+                    )
                 )
-            )
     return lines
 
 
@@ -564,46 +583,143 @@ def is_contents_page(lines: list[Line], index: int, page_count: int) -> bool:
     return rising and (ratio >= 0.5 or (titled and ratio >= 0.3))
 
 
-def find_text_tables(lines: list[Line], med_h: float, text_w: float) -> list[Box]:
-    """Tables set as plain text: runs of rows made of separate short cells."""
-    rows = group_rows(lines)
+def find_text_tables(lines: list[Line], med_h: float, text_w: float, body_size: float | None = None) -> list[Box]:
+    """Tables set as plain text: runs of rows made of separate short cells.
+
+    A row counts if it has two or more cells, one of them short. Up to two
+    other rows (wrapped cell text, section labels) may sit inside a table,
+    and a tightly spaced indented line right after the last row (a wrapped
+    first cell) is kept with it. Full-width lines of body text are never
+    cells, so body text beside a table is not swallowed into it.
+    """
+
+    def body_line(ln: Line) -> bool:
+        return bool(body_size and ln.size and abs(ln.size - body_size) < 0.3 and ln.box.w >= 0.8 * text_w)
+
+    rows = [[ln for ln in r if not body_line(ln)] for r in group_rows(lines)]
+    rows = [r for r in rows if r]
+    # A caption ("Table 2.1: ...") is never part of a table; it ends one.
+    caption = [bool(CAPTION_RE.match(" ".join(ln.text for ln in r).strip())) for r in rows]
     multi = []
     for r in rows:
         cells = [r[0].box]
         for ln in r[1:]:
-            if ln.box.x0 - cells[-1].x1 >= 1.5 * med_h:
+            if ln.box.x0 - cells[-1].x1 >= med_h:
                 cells.append(ln.box)
             else:
                 cells[-1] = cells[-1].union(ln.box)
         multi.append(len(cells) >= 2 and any(c.w < 0.3 * text_w for c in cells))
+
+    def top(i: int) -> float:
+        return min(ln.box.y0 for ln in rows[i])
+
+    def bottom(i: int) -> float:
+        return max(ln.box.y1 for ln in rows[i])
 
     tables = []
     run: list[int] = []
 
     def close_run():
         if sum(multi[i] for i in run) >= 4:
-            b = None
-            for i in run:
-                for ln in rows[i]:
-                    b = ln.box if b is None else b.union(ln.box)
+            b = _bbox([ln for i in run for ln in rows[i]])
             tables.append(b.expand(0.3 * med_h))
 
-    for i, r in enumerate(rows):
-        top = min(ln.box.y0 for ln in r)
-        prev_bottom = max(ln.box.y1 for ln in rows[run[-1]]) if run else None
-        contiguous = prev_bottom is not None and top - prev_bottom < 2 * med_h
-        if multi[i] and (contiguous or not run):
-            run.append(i)
-        elif multi[i]:
+    for i in range(len(rows)):
+        contiguous = bool(run) and top(i) - bottom(run[-1]) < 2 * med_h
+        if caption[i]:
             close_run()
-            run = [i]
-        elif run and contiguous and i + 1 < len(rows) and multi[i + 1]:
-            run.append(i)  # a single label row inside a table
+            run = []
+        elif multi[i]:
+            if not contiguous:
+                close_run()
+                run = []
+            run.append(i)
+        elif contiguous and any(multi[j] and not any(caption[i:j]) for j in range(i + 1, min(i + 3, len(rows)))):
+            run.append(i)  # wrapped cell text or a section label inside the table
+        elif (
+            contiguous
+            and multi[run[-1]]
+            and top(i) - bottom(run[-1]) < 0.6 * med_h
+            and rows[i][0].box.x0 > min(rows[j][0].box.x0 for j in run) + 0.5 * med_h
+        ):
+            run.append(i)  # the last row's first cell wraps onto an indented line
         else:
             close_run()
             run = []
     close_run()
     return tables
+
+
+def _rule_segments(page: pymupdf.Page) -> list[tuple[float, float, float]]:
+    """Horizontal rules drawn on the page, as (x0, y, x1)."""
+    if page.rotation:
+        return []
+    segs = []
+    for d in page.get_drawings():
+        if not _visible(d, page.rect):
+            continue
+        for it in d["items"]:
+            if it[0] == "l" and abs(it[1].y - it[2].y) < 1:
+                segs.append((min(it[1].x, it[2].x), it[1].y, max(it[1].x, it[2].x)))
+            elif it[0] == "re" and it[1].height <= 2 and it[1].width > 10:
+                segs.append((it[1].x0, (it[1].y0 + it[1].y1) / 2, it[1].x1))
+    return segs
+
+
+def find_ruled_tables(page: pymupdf.Page, lines: list[Line], med_h: float) -> list[Box]:
+    """Tables drawn with horizontal rules: a stack of three or more rules.
+
+    Rules may be far apart (a three-rule "booktabs" table has a long body
+    between its middle and bottom rules), so a frame only counts if the text
+    inside it forms table rows: at least two rows of two or more cells.
+
+    The frame runs from the first rule to the last; when the table sits on a
+    shaded background panel, it extends to the panel's bottom so a last row
+    without a rule under it (and any table notes) is included. A caption
+    above the first rule stays outside.
+    """
+    rules: list[list[float]] = []
+    for x0, y, x1 in sorted(_rule_segments(page), key=lambda s: (round(s[1]), s[0])):
+        if rules and abs(rules[-1][1] - y) < 1 and x0 <= rules[-1][2] + 3:
+            rules[-1][2] = max(rules[-1][2], x1)  # one rule drawn in pieces, e.g. split at columns
+        else:
+            rules.append([x0, y, x1])
+    rules = sorted((r for r in rules if r[2] - r[0] >= 40), key=lambda r: r[1])
+
+    captions = [ln.box for ln in lines if CAPTION_RE.match(ln.text.strip())]
+    stacks: list[list[list[float]]] = []
+    for r in rules:
+        for s in stacks:
+            last = s[-1]
+            overlap = min(last[2], r[2]) - max(last[0], r[0])
+            # A caption between two rules separates two tables.
+            split = any(last[1] < c.cy < r[1] and c.x1 > max(last[0], r[0]) and c.x0 < min(last[2], r[2]) for c in captions)
+            if overlap >= 0.8 * min(last[2] - last[0], r[2] - r[0]) and r[1] - last[1] <= 0.5 * page.rect.height and not split:
+                s.append(r)
+                break
+        else:
+            stacks.append([r])
+
+    panels = [
+        d["rect"]
+        for d in page.get_drawings()
+        if d.get("fill") and not all(v >= 0.95 for v in d["fill"]) and d["rect"].width > 40
+    ]
+    frames = []
+    for s in stacks:
+        if len(s) < 3:
+            continue
+        f = Box(min(r[0] for r in s), s[0][1], max(r[2] for r in s), s[-1][1])
+        for pr in panels:
+            if pr.x0 <= f.x0 + 2 and pr.x1 >= f.x1 - 2 and pr.y0 <= f.y0 + 2 and pr.y1 >= f.y1 - 2:
+                f = Box(f.x0, f.y0, f.x1, max(f.y1, pr.y1))
+        rows_with_cells = 0
+        for r in group_rows([ln for ln in lines if f.contains_point(ln.box.cx, ln.box.cy)]):
+            if any(b.box.x0 - a.box.x1 >= med_h for a, b in zip(r, r[1:])):
+                rows_with_cells += 1
+        if rows_with_cells >= 2:
+            frames.append(f)
+    return frames
 
 
 # --------------------------------------------------------------------------
@@ -618,6 +734,49 @@ def _visible(drawing: dict, page_rect: pymupdf.Rect) -> bool:
     r = drawing["rect"]
     on_page = r.x1 > page_rect.x0 and r.x0 < page_rect.x1 and r.y1 > page_rect.y0 and r.y0 < page_rect.y1
     return on_page and not (white(drawing.get("fill")) and white(drawing.get("color")))
+
+
+def is_table_grid(page: pymupdf.Page, box: Box) -> bool:
+    """Is a drawing cluster just a few long straight rules (a table's grid)?
+
+    Every piece must be a horizontal or vertical line; joined end to end
+    they make at most 12 lines, each spanning at least 30% of the cluster.
+    Dendrograms and charts (many short or slanted segments, filled bars,
+    curves) are not grids.
+    """
+    hs, vs = [], []
+    for d in page.get_drawings():
+        r = d["rect"]
+        if not _visible(d, page.rect) or not box.expand(1).contains_point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2):
+            continue
+        if d.get("fill") and not all(v >= 0.95 for v in d["fill"]) and min(r.width, r.height) > 2:
+            return False  # filled shapes: bars, boxes
+        for it in d["items"]:
+            if it[0] == "l" and abs(it[1].y - it[2].y) < 1:
+                hs.append((round(it[1].y), min(it[1].x, it[2].x), max(it[1].x, it[2].x)))
+            elif it[0] == "l" and abs(it[1].x - it[2].x) < 1:
+                vs.append((round(it[1].x), min(it[1].y, it[2].y), max(it[1].y, it[2].y)))
+            elif it[0] == "re" and min(it[1].width, it[1].height) <= 2:
+                if it[1].width >= it[1].height:
+                    hs.append((round(it[1].y0), it[1].x0, it[1].x1))
+                else:
+                    vs.append((round(it[1].x0), it[1].y0, it[1].y1))
+            else:
+                return False  # curves, slanted lines, boxes
+
+    def joined(segs):
+        out: list[list[float]] = []
+        for pos, a, b in sorted(segs):
+            if out and out[-1][0] == pos and a <= out[-1][2] + 2:
+                out[-1][2] = max(out[-1][2], b)
+            else:
+                out.append([pos, a, b])
+        return out
+
+    lines_h, lines_v = joined(hs), joined(vs)
+    if not lines_h and not lines_v or len(lines_h) + len(lines_v) > 12:
+        return False
+    return all(b - a >= 0.3 * box.w for _, a, b in lines_h) and all(b - a >= 0.3 * box.h for _, a, b in lines_v)
 
 
 def drawing_cluster_boxes(page: pymupdf.Page) -> list[Box]:
@@ -709,7 +868,9 @@ def find_figures(
     mode: str,
     images: list[Box],
     scanned: bool,
+    tables: list[Box] = (),
 ) -> list[Box]:
+    """Figure boxes; drawings that are just ruled ``tables`` (frames, panels) are skipped."""
     pw, ph = page.rect.width, page.rect.height
     page_area = pw * ph
     candidates: list[Box] = []
@@ -721,7 +882,12 @@ def find_figures(
         candidates += [
             b
             for b in drawing_cluster_boxes(page)
-            if b.area >= 0.01 * page_area and b.w >= 0.08 * pw and b.h >= 0.04 * ph and text_coverage(b, lines) <= 0.4
+            if b.area >= 0.01 * page_area
+            and b.w >= 0.08 * pw
+            and b.h >= 0.04 * ph
+            and text_coverage(b, lines) <= 0.4
+            and not any(b.intersection_area(t) >= 0.5 * min(b.area, t.area) for t in tables)
+            and not is_table_grid(page, b)
         ]
 
     figs = []
@@ -745,7 +911,25 @@ def is_label(ln: Line, fig: Box) -> bool:
     if CAPTION_RE.match(t) or re.search(r"[A-Za-z]{2,}\.$", t) or ln.box.w > 0.6 * fig.w:
         return False
     letters = sum(c.isalpha() for c in t)
-    return (len(t.split()) <= 3 and len(t) <= 20) or letters <= 0.4 * len(t)
+    return (len(t.split()) <= 6 and len(t) <= 40) or letters <= 0.4 * len(t)
+
+
+def trim_figure(fig: Box, lines: list[Line]) -> Box:
+    """Pull a figure's top/bottom edge back off overlapping caption or prose lines.
+
+    Drawing extents often reach a few points into the caption below; a line
+    that is a caption or ordinary prose (8+ words) is text, not part of the
+    figure, and must not be cropped away with it.
+    """
+    for ln in lines:
+        b, t = ln.box, ln.text.strip()
+        if fig.intersection_area(b) <= 0 or not (CAPTION_RE.match(t) or len(t.split()) >= 8):
+            continue
+        if b.cy > fig.y1 - 0.2 * fig.h:
+            fig = Box(fig.x0, fig.y0, fig.x1, min(fig.y1, b.y0 - 0.5))
+        elif b.cy < fig.y0 + 0.2 * fig.h:
+            fig = Box(fig.x0, max(fig.y0, b.y1 + 0.5), fig.x1, fig.y1)
+    return fig
 
 
 def absorb_labels(figs: list[Box], lines: list[Line], smalls: list[Box], gap: float) -> list[Box]:
@@ -755,8 +939,10 @@ def absorb_labels(figs: list[Box], lines: list[Line], smalls: list[Box], gap: fl
         changed = False
         for i, f in enumerate(figs):
             for ln in lines:
-                if not f.contains_point(ln.box.cx, ln.box.cy) and f.near(ln.box, gap) and is_label(ln, f):
-                    f = f.union(ln.box)
+                b = ln.box
+                fully_inside = f.x0 <= b.x0 and b.x1 <= f.x1 and f.y0 <= b.y0 and b.y1 <= f.y1
+                if not fully_inside and f.near(b, gap) and is_label(ln, f):
+                    f = f.union(b)
                     changed = True
             for b in smalls:
                 if f.near(b, gap) and f.intersection_area(b) < b.area:
@@ -771,59 +957,127 @@ def absorb_labels(figs: list[Box], lines: list[Line], smalls: list[Box], gap: fl
 # --------------------------------------------------------------------------
 
 
-def markdown_table(lines: list[Line], med_h: float) -> str | None:
-    """A pipe table for a text table whose cells line up in clear columns.
+def markdown_table(
+    lines: list[Line], med_h: float, strict: bool = False, max_cols: int = 10
+) -> tuple[str, str] | None:
+    """A pipe table, plus any table notes, for text laid out in clear columns.
 
-    Returns None when the layout is irregular (a body line straddling two
-    columns, too many columns); the caller then saves the table as an image.
+    - Lines are assigned to the whitespace-separated columns they fall in.
+    - An indented line continues the cell above (wrapped text); an unindented
+      one in an otherwise empty row starts a new item in that cell.
+    - Rows above the first full row merge into the header; first-column-only
+      rows in the body are section labels and are bolded.
+    - Rows at the bottom starting with a superscript marker are table notes.
+
+    ``strict`` (for OCR) also requires at most 4 columns with short cells
+    outside the first. Returns None when the layout is irregular (a body
+    line straddling columns, too many columns); the caller then saves the
+    table as an image.
     """
     rows = group_rows(lines)
+    # Table notes: the trailing single-line rows, from the first one that
+    # starts with a superscript marker; unmarked lines continue a note.
+    k = len(rows)
+    while k > 0 and len(rows[k - 1]) == 1:
+        k -= 1
+    first_note = next((i for i in range(k, len(rows)) if rows[i][0].md.startswith("^")), None)
+    notes: list[str] = []
+    if first_note is not None:
+        for r in rows[first_note:]:
+            if r[0].md.startswith("^") or not notes:
+                notes.append(r[0].md)
+            else:
+                notes[-1] = join_text(notes[-1], r[0].md)
+        rows = rows[:first_note]
     if len(rows) < 2:
         return None
 
-    # Columns are the x-ranges separated by whitespace in every row.
-    spans = sorted((ln.box.x0, ln.box.x1) for ln in lines)
+    # Columns are the x-ranges separated by whitespace in every row with two
+    # or more cells (lone lines may be labels spanning several columns).
+    spans = sorted((ln.box.x0, ln.box.x1) for r in rows if len(r) > 1 for ln in r)
+    if not spans:
+        return None
     cols = [list(spans[0])]
     for s, e in spans[1:]:
         if s - cols[-1][1] >= 0.8 * med_h:
             cols.append([s, e])
         else:
             cols[-1][1] = max(cols[-1][1], e)
-    if not 2 <= len(cols) <= 10:
+    if not 2 <= len(cols) <= (4 if strict else max_cols):
         return None
 
     def column(b: Box) -> int:
-        return min(range(len(cols)), key=lambda k: 0 if cols[k][0] <= b.cx <= cols[k][1] else
-                   min(abs(b.cx - cols[k][0]), abs(b.cx - cols[k][1])))
+        return min(
+            range(len(cols)),
+            key=lambda k: 0 if cols[k][0] <= b.cx <= cols[k][1] else min(abs(b.cx - cols[k][0]), abs(b.cx - cols[k][1])),
+        )
 
     grid: list[list[str]] = []
+    labels: list[bool] = []  # section label rows ("GUIDANCE DOCUMENTS")
+    last_x0: list[list[float]] = []  # left edge of the last line placed in each cell
+    started = False  # seen a row with two or more cells (the header)
+    header_top: list[str] = []  # first-column lines above the header row
     for n, r in enumerate(rows):
-        row = [""] * len(cols)
+        row, xs = [""] * len(cols), [0.0] * len(cols)
         for ln in r:
             i = column(ln.box)
-            straddles = sum(ln.box.x0 < e - med_h and ln.box.x1 > s + med_h for s, e in cols) > 1
-            if straddles and n > 0:
-                return None  # a merged cell in the body: not a simple grid
+            if sum(ln.box.x0 < e - med_h and ln.box.x1 > s + med_h for s, e in cols) > 1:
+                if len(r) > 1 and n > 0:
+                    return None  # a merged cell in the body: not a simple grid
+                # A lone spanning line (section label, header): its starting column.
+                i = min(range(len(cols)), key=lambda k: abs(ln.box.x0 - cols[k][0]))
             text = ln.md.replace("|", "\\|")
-            if not row[i] and ln.box.x0 - cols[i][0] > med_h and i == 0:
-                text = "\u00a0" * 4 + text  # indented row label
             row[i] = (row[i] + " " + text).strip() if row[i] else text
-        if grid and not row[0] and sum(bool(x) for x in row) == 1:
-            k = next(i for i, x in enumerate(row) if x)
-            grid[-1][k] = (grid[-1][k] + " " + row[k]).strip()  # wrapped cell text
+            xs[i] = xs[i] or ln.box.x0
+        filled = [i for i, x in enumerate(row) if x]
+        if grid and (not row[0] or (filled == [0] and xs[0] > last_x0[-1][0] + 0.5 * med_h)):
+            # Continuation of the row above: wrapped text (indented) or another item.
+            for i in filled:
+                wrapped = xs[i] > last_x0[-1][i] + 0.5 * med_h or not grid[-1][i]
+                sep = " " if wrapped else "<br>"
+                grid[-1][i] = join_text(grid[-1][i], row[i]) if sep == " " else grid[-1][i] + sep + row[i]
+                if not wrapped or not last_x0[-1][i]:
+                    last_x0[-1][i] = xs[i]
             continue
+        if not started and len(filled) < 2:
+            header_top.append(row[filled[0]] if filled else "")  # top lines of a multi-line header cell
+            continue
+        if not started and header_top:
+            row[0] = " ".join(t for t in header_top + [row[0]] if t)
+        letters = [c for c in plain_of(row[0]) if c.isalpha()]
+        label = started and filled == [0] and (all(ln.bold for ln in r) or bool(letters) and all(c.isupper() for c in letters))
+        if label and not row[0].startswith("**"):
+            row[0] = f"**{row[0]}**"  # section label row
+        if len(filled) >= 2:
+            started = True
+        if xs[0] - cols[0][0] > med_h and row[0]:
+            row[0] = "\u00a0" * 4 + row[0]  # indented row label
         grid.append(row)
+        labels.append(label)
+        last_x0.append(xs)
+    if not started or len(grid) < 2:
+        return None
 
     def numeric(s: str) -> bool:
         return bool(re.fullmatch(r"[-+−–]?[\d.,]+%?", plain_of(s).strip()))
 
+    if strict:
+        body = [r for r, lab in zip(grid[1:], labels[1:]) if not lab]  # skip section labels
+        if any(len(plain_of(r[i])) > 25 for r in body for i in range(1, len(cols))):
+            return None
+        for i in range(1, len(cols)):
+            if grid[0][i] and not all(r[i] for r in body):
+                return None  # an empty cell under a header: OCR may have missed it (e.g. single digits)
     align = []
     for i in range(len(cols)):
         body = [r[i] for r in grid[1:] if r[i]]
         align.append("---:" if body and sum(map(numeric, body)) >= 0.7 * len(body) else "---")
     out = ["| " + " | ".join(grid[0]) + " |", "|" + "|".join(align) + "|"]
     out += ["| " + " | ".join(r) + " |" for r in grid[1:]]
-    return "\n".join(out)
+    note_md = ""
+    for nt in notes:
+        note_md = note_md + "\\\n" + nt if note_md else nt  # one note per line
+    return "\n".join(out), note_md
 
 
 # --------------------------------------------------------------------------
@@ -947,21 +1201,48 @@ def finish_page(
     med_h = statistics.median([ln.box.h for ln in lines]) if lines else 10.0
     long_lines = [ln.box.w for ln in lines if len(ln.text) >= 40]
     text_w = statistics.median(long_lines) if long_lines else 0.7 * pw
+    sizes = [ln.size for ln in lines if ln.size and len(ln.text) >= 40]
+    body_size = statistics.median(sizes) if sizes else None
+    gap = 0.01 * min(pw, ph)
 
-    boxes = [] if args.figures == "none" else find_figures(page, get_img, lines, args.figures, prep.images, scanned)
+    def inside(region: Box, pool: list[Line]) -> list[Line]:
+        return [ln for ln in pool if region.contains_point(ln.box.cx, ln.box.cy)]
+
+    def as_markdown(region: Box, cells: list[Line], max_cols: int) -> bool:
+        """Add the region as a Markdown table if it converts cleanly."""
+        if args.tables not in ("auto", "markdown"):
+            return False
+        strict = args.tables == "auto" and pd.source == "ocr"  # OCR'd tables only when clean
+        res = markdown_table(cells, med_h, strict=strict, max_cols=max_cols)
+        if res:
+            pd.tables.append(Table(region, *res))
+        return bool(res)
+
+    # Page numbers and chapter tabs in the margins are not table cells.
+    margin_nums = {id(ln) for ln in margin_page_numbers(lines, ph)}
+    candidates = [ln for ln in lines if not ln.mono and id(ln) not in margin_nums]
+
+    # 1. Ruled tables, then figures (skipping drawings that are table frames),
+    #    with the labels around them; 2. tables set as plain text in the rest.
+    ruled = [] if args.tables == "text" else find_ruled_tables(page, candidates, med_h)
+    figures = []
+    if args.figures != "none":
+        figures = find_figures(page, get_img, lines, args.figures, prep.images, scanned, ruled)
+        smalls = [b for b in prep.images if b.area < 0.004 * page_area]
+        body = [ln for ln in lines if 0.1 * ph < ln.box.cy < 0.9 * ph]  # not running heads, page numbers
+        figures = absorb_labels(merge_boxes(figures, gap), body, smalls, gap=1.5 * med_h)
+        figures = [f for f in (trim_figure(f, lines) for f in figures) if f.h > 0 and f.w > 0]
+    boxes = list(figures)
+    free = [ln for ln in candidates if not any(f.contains_point(ln.box.cx, ln.box.cy) for f in figures)]
+    for frame in ruled:
+        if not as_markdown(frame, inside(frame, free), max_cols=10):
+            boxes.append(frame)
+        free = [ln for ln in free if not frame.contains_point(ln.box.cx, ln.box.cy)]
     if args.tables != "text":
-        for tb in find_text_tables([ln for ln in lines if not ln.mono], med_h, text_w):
-            inside = [ln for ln in lines if tb.contains_point(ln.box.cx, ln.box.cy)]
-            md = None
-            if args.tables == "markdown" or (args.tables == "auto" and pd.source == "text"):
-                md = markdown_table(inside, med_h)
-            if md:
-                pd.tables.append(Table(tb, md))
-            else:
+        for tb in find_text_tables(free, med_h, text_w, body_size):
+            if not as_markdown(tb, inside(tb, free), max_cols=10):
                 boxes.append(tb)
-    boxes = merge_boxes(boxes, gap=0.01 * min(pw, ph))
-    smalls = [b for b in prep.images if b.area < 0.004 * page_area]
-    boxes = absorb_labels(boxes, lines, smalls, gap=1.2 * med_h)
+    boxes = merge_boxes(boxes, gap)
     boxes = [b.expand(0.004 * min(pw, ph)) for b in boxes]
     boxes.sort(key=lambda b: (b.y0, b.x0))
 
@@ -1030,6 +1311,20 @@ def index_pages_from_toc(toc: list[list], page_count: int) -> set[int]:
 PAGE_NUM_RE = re.compile(r"^(page\s+)?([\divxlcdm]+)(\s+(of|/)\s+\d+)?$", re.IGNORECASE)
 
 
+def margin_page_numbers(lines: list[Line], height: float, zone: float = 0.1) -> list[Line]:
+    """Page-number lines: a bare number alone in the top or bottom margin zone.
+
+    Several bare numbers in one zone are table cells (years, values) that
+    happen to sit near the page edge, not page numbers.
+    """
+    out = []
+    for in_zone in (lambda ln: ln.box.cy < height * zone, lambda ln: ln.box.cy > height * (1 - zone)):
+        nums = [ln for ln in lines if in_zone(ln) and PAGE_NUM_RE.match(ln.text.strip(" .-–—|"))]
+        if len(nums) == 1:
+            out += nums
+    return out
+
+
 def _norm_header(text: str) -> str:
     return re.sub(r"\d+", "#", text.lower()).strip(" .-–—|#")
 
@@ -1040,9 +1335,6 @@ def remove_running_heads(pages: list[PageData], zone: float = 0.1) -> None:
     def in_zone(ln: Line, p: PageData) -> bool:
         return ln.box.cy < p.height * zone or ln.box.cy > p.height * (1 - zone)
 
-    def is_page_num(ln: Line) -> bool:
-        return bool(PAGE_NUM_RE.match(ln.text.strip(" .-–—|")))
-
     def beside(ln: Line, nums: list[Line]) -> bool:
         return any(min(ln.box.y1, n.box.y1) - max(ln.box.y0, n.box.y0) > 0.5 * min(ln.box.h, n.box.h) for n in nums)
 
@@ -1050,11 +1342,12 @@ def remove_running_heads(pages: list[PageData], zone: float = 0.1) -> None:
     for p in pages:
         counts.update({_norm_header(ln.text) for ln in p.lines if in_zone(ln, p)})
     for p in pages:
-        nums = [ln for ln in p.lines if in_zone(ln, p) and is_page_num(ln)]
+        nums = margin_page_numbers(p.lines, p.height, zone)
+        num_ids = {id(n) for n in nums}
         p.lines = [
             ln
             for ln in p.lines
-            if not (in_zone(ln, p) and (is_page_num(ln) or beside(ln, nums) or counts[_norm_header(ln.text)] >= 2))
+            if not (in_zone(ln, p) and (id(ln) in num_ids or beside(ln, nums) or counts[_norm_header(ln.text)] >= 2))
         ]
 
 
@@ -1185,6 +1478,7 @@ class Block:
     nlines: int = 0
     hanging: bool = False
     caption: str = ""  # figures and tables
+    notes: str = ""  # table footnotes
     ident: str = ""  # anchor id for cross-references
 
 
@@ -1271,7 +1565,7 @@ def build_blocks(p: PageData, m: Metrics) -> list[Block]:
             if it.figure:
                 blocks.append(Block("figure", it.figure.path, page=p.number))
             elif it.table:
-                blocks.append(Block("table", it.table.md, page=p.number))
+                blocks.append(Block("table", it.table.md, page=p.number, notes=it.table.notes))
             else:
                 blocks.append(Block("code", it.code, page=p.number))
             prev = None
@@ -1592,6 +1886,8 @@ def render_markdown(blocks: list[Block], page_markers: bool, front_matter: dict[
             out.append(b.text + "\n")
             if b.caption:
                 out.append(f"Table: {b.caption}\n")
+            if b.notes:
+                out.append(b.notes + "\n")
         elif b.kind == "footnote":
             out.append(b.text + "\n")
         elif b.kind == "code":

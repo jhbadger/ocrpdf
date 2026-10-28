@@ -42,7 +42,7 @@ Useful options (`./ocrpdf.py -h` lists them all):
 | `--image-dpi 200`, `--jpeg-quality 75` | figure image resolution and quality (see below) |
 | `--fast` | Vision's faster, less accurate recogniser |
 | `--figures auto\|embedded\|ink\|none` | how figures are found (see below) |
-| `--tables auto\|markdown\|image\|text` | text tables: Markdown tables when the text layer has clear columns, else images (default `auto`) |
+| `--tables auto\|markdown\|image\|text` | tables: Markdown when their columns are clear (OCR'd tables only when also complete), else images (default `auto`) |
 | `--no-outline` | don't use the PDF's bookmarks for headings |
 | `--keep-contents` | keep table-of-contents pages (skipped by default; the EPUB makes its own) |
 | `--keep-index` | keep the index (dropped by default; its page numbers mean nothing in an EPUB) |
@@ -63,13 +63,26 @@ Useful options (`./ocrpdf.py -h` lists them all):
    - Banners and watermarks repeated on many pages are ignored.
 2. **Figures and tables**:
    - *Born-digital pages*: embedded images and clusters of visible vector
-     drawings (charts) become figures. Short labels hugging a figure, like
-     axis ticks, are pulled into it.
+     drawings (charts, diagrams) become figures. Short labels around a
+     figure (axis ticks, diagram labels) are pulled into it. Its edges are
+     trimmed off any caption or prose they overlap.
    - *Scanned pages*: recognised text is masked out and the remaining large
      blobs of ink become figures.
-   - *Tables set as text* (rows of separate short cells) become Markdown
-     tables when their columns are clear in the text layer, otherwise
-     images.
+   - *Tables*:
+     - *Ruled tables* are found from their rules: a stack of horizontal
+       rules, or a grid of a few long straight lines. A shaded panel
+       behind the table extends it to include the last row and notes.
+     - *Unruled tables* are rows of separate short cells. Wrapped cell text
+       and section labels may sit inside; a caption always ends a table.
+     - Tables become Markdown when their columns are clear:
+       - Wrapped cell text is joined, and separate items in one cell keep
+         line breaks.
+       - Multi-line header cells are merged.
+       - Section-label rows (capitals or bold) are bolded.
+       - Footnotes at the bottom become notes under the table.
+     - OCR'd tables become Markdown only when complete: up to 4 columns,
+       short cells, and no empty cell under a header (Vision sometimes
+       misses single digits). Anything irregular is saved as an image.
    - Each figure is cropped as a JPEG from a render at `--image-dpi`;
      text inside it is dropped.
 3. **Reading order**: recursive XY-cut over lines and figures (columns first,

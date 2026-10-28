@@ -108,8 +108,53 @@ def test_markdown_table():
     lines = [line(a, 90, 100 + 16 * i, 130, 110 + 16 * i) for i, (a, _) in enumerate(rows)]
     lines += [line(b, 300, 100 + 16 * i, 320, 110 + 16 * i) for i, (_, b) in enumerate(rows)]
     assert ocrpdf.markdown_table(lines, 10) == (
-        "| Item | Count |\n|---|---:|\n| Apples | 12 |\n| Pears | 9 |"
+        "| Item | Count |\n|---|---:|\n| Apples | 12 |\n| Pears | 9 |",
+        "",
     )
+
+
+def test_markdown_table_continuations_sections_and_notes():
+    lines = [
+        line("Document", 50, 100, 120, 110), line("Date", 400, 100, 430, 110),
+        line("GUIDANCE", 50, 115, 120, 125),
+        line("A long title that wraps onto", 50, 130, 350, 140), line("2021", 400, 130, 430, 140),
+        line("a second line", 60, 141, 160, 151),
+        line("Another title", 50, 156, 200, 166), line("2020", 400, 156, 430, 166),
+        line("a The note.", 50, 175, 200, 183, md="^a^The note."),
+    ]
+    md, notes = ocrpdf.markdown_table(lines, 10)
+    assert md.splitlines() == [
+        "| Document | Date |",
+        "|---|---:|",
+        "| **GUIDANCE** |  |",
+        "| A long title that wraps onto a second line | 2021 |",
+        "| Another title | 2020 |",
+    ]
+    assert notes == "^a^The note."
+
+
+def test_strict_markdown_table_rejects_missing_values():
+    rows = [("Item", "Count"), ("Apples", "12"), ("Pears", ""), ("Plums", "6")]
+    lines = [line(a, 90, 100 + 16 * i, 130, 110 + 16 * i) for i, (a, _) in enumerate(rows)]
+    lines += [line(b, 300, 100 + 16 * i, 320, 110 + 16 * i) for i, (_, b) in enumerate(rows) if b]
+    assert ocrpdf.markdown_table(lines, 10) is not None
+    assert ocrpdf.markdown_table(lines, 10, strict=True) is None
+
+
+def test_caption_ends_a_text_table():
+    def table(y0):
+        out = [line(f"Name {i}", 50, y0 + 14 * i, 120, y0 + 14 * i + 10) for i in range(5)]
+        return out + [line(str(i), 300, y0 + 14 * i, 310, y0 + 14 * i + 10) for i in range(5)]
+
+    lines = table(100) + [line("Table 1: First table.", 50, 172, 200, 182)] + table(186)
+    assert len(ocrpdf.find_text_tables(lines, 10, 300)) == 2
+
+
+def test_margin_page_numbers():
+    page_num = line("17", 300, 760, 312, 770)
+    assert ocrpdf.margin_page_numbers([page_num, line("Text", 50, 400, 300, 410)], 800) == [page_num]
+    years = [line("2021", 500, 10, 520, 20), line("2020", 500, 25, 520, 35)]
+    assert ocrpdf.margin_page_numbers(years, 800) == []
 
 
 def test_contents_page_needs_rising_page_numbers():
