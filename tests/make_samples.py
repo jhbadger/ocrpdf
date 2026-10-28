@@ -6,8 +6,13 @@
 
     uv run --script tests/make_samples.py OUTDIR
 
-Writes OUTDIR/digital.pdf (born-digital text + an embedded image + a vector
-chart) and OUTDIR/scanned.pdf (the same pages rasterised to images only).
+Writes OUTDIR/digital.pdf (born-digital) and OUTDIR/scanned.pdf (the same
+pages rasterised to images only, with the same bookmarks). Between them they
+cover: a chapter heading, paragraphs with a first-line indent, a picture with
+a caption, a bullet list, a paragraph split across a page break, two columns,
+a vector chart, superscripts/subscripts, a footnote, a plain-text table with
+a caption, monospaced code, cross-references, running heads, page numbers,
+bookmarks and an index.
 """
 
 import io
@@ -49,7 +54,7 @@ def main(outdir: Path) -> None:
     header(p, 1)
     p.insert_htmlbox(
         pymupdf.Rect(72, 60, 540, 330),
-        "<h1 style='font-size:28px'>Chapter One</h1>"
+        "<h1 style='font-size:28px'>Chapter 1</h1>"
         f"<p style='font-size:11px'>{LOREM * 3}</p>"
         f"<p style='font-size:11px;text-indent:20px'>{LOREM * 2}</p>",
     )
@@ -81,15 +86,54 @@ def main(outdir: Path) -> None:
     p.draw_line((190, 740), (430, 740), color=(0, 0, 0), width=1.5)
     p.draw_line((190, 740), (190, 580), color=(0, 0, 0), width=1.5)
 
-    doc.save(outdir / "digital.pdf")
+    # Page 3: super/subscripts and a footnote, a text table, code, references.
+    p = doc.new_page()
+    header(p, 3)
+    p.insert_htmlbox(
+        pymupdf.Rect(72, 60, 540, 230),
+        "<h2 style='font-size:18px'>Results</h2>"
+        "<p style='font-size:11px'>Water is H<sub>2</sub>O and the yield was 10<sup>3</sup> per litre. "
+        "As shown in figure 1 and table 1, the results hold.<sup>1</sup> The rest of this paragraph is "
+        "long enough to wrap onto a second line of text in the box.</p>",
+    )
+    for y, cells in zip(range(260, 340, 16), [("Item", "Count", "Share"), ("Apples", "12", "40%"),
+                                              ("Pears", "9", "30%"), ("Plums", "6", "20%"), ("Figs", "3", "10%")]):
+        for x, cell in zip((90, 300, 420), cells):
+            p.insert_text((x, y), cell, fontsize=10)
+    p.insert_text((72, 360), "Table 1: Fruit counts from the orchard.", fontsize=10)
+    p.insert_text((72, 400), "def answer():", fontsize=10, fontname="cour")
+    p.insert_text((72 + 24, 414), "return 42", fontsize=10, fontname="cour")
+    p.insert_htmlbox(
+        pymupdf.Rect(72, 440, 540, 520),
+        "<p style='font-size:11px'>See chapter 1 for the background to all of this.</p>",
+    )
+    p.insert_htmlbox(
+        pymupdf.Rect(72, 700, 540, 740),
+        "<p style='font-size:8px'><sup>1</sup> A footnote about the results.</p>",
+    )
+
+    # Page 4: an index, which is dropped by default.
+    p = doc.new_page()
+    header(p, 4)
+    p.insert_htmlbox(
+        pymupdf.Rect(72, 60, 540, 400),
+        "<h1 style='font-size:28px'>Index</h1>"
+        + "".join(f"<p style='font-size:11px'>{e}</p>" for e in ("apples, 3", "foxes, 1, 2", "pears, 3", "rivers, 1")),
+    )
+
+    toc = [[1, "Chapter 1", 1], [2, "Two Columns", 2], [2, "Results", 3], [1, "Index", 4]]
+    doc.set_toc(toc)
+    doc.subset_fonts()
+    doc.save(outdir / "digital.pdf", garbage=4, deflate=True)
 
     # Scanned copy: each page becomes a single greyscale image.
     scan = pymupdf.open()
     for page in doc:
         pix = page.get_pixmap(dpi=200, colorspace=pymupdf.csGRAY)
         sp = scan.new_page(width=page.rect.width, height=page.rect.height)
-        sp.insert_image(sp.rect, stream=pix.tobytes("png"))
-    scan.save(outdir / "scanned.pdf")
+        sp.insert_image(sp.rect, stream=pix.tobytes("jpeg", jpg_quality=75))
+    scan.set_toc(toc)
+    scan.save(outdir / "scanned.pdf", garbage=4, deflate=True)
 
 
 if __name__ == "__main__":

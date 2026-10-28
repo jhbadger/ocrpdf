@@ -5,3 +5,6 @@ __pycache__/
 *.pdf
 *.epub
 out/
+
+# Small synthetic test PDFs are part of the test suite.
+!tests/fixtures/*.pdf

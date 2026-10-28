@@ -37,14 +37,19 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import hashlib
 import io
 import json
+import os
 import re
+import shutil
 import socket
 import statistics
+import subprocess
 import sys
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -145,13 +150,20 @@ class Figure:
 
 
 @dataclass
+class Table:
+    box: Box
+    md: str  # pipe table
+
+
+@dataclass
 class PageData:
     number: int  # 1-based
     width: float
     height: float
     lines: list[Line] = field(default_factory=list)
     figures: list[Figure] = field(default_factory=list)
-    source: str = "ocr"  # "ocr", "text" or "skipped"
+    tables: list[Table] = field(default_factory=list)
+    source: str = "ocr"  # "ocr", "text", "skipped" (contents) or "index"
 
 
 # --------------------------------------------------------------------------
@@ -175,7 +187,7 @@ def clean_text(s: str) -> str:
     return re.sub("\u00ad(?=.)", "", s)  # soft hyphens, except at a line end
 
 
-_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>])")
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>^~])")
 
 
 def md_escape(text: str) -> str:
@@ -189,7 +201,7 @@ def escape_block_start(md: str) -> str:
 
 
 def strip_emphasis(md: str) -> str:
-    return re.sub(r"(?<!\\)[*`]", "", md)
+    return re.sub(r"(?<!\\)[*`^~]", "", md)
 
 
 def plain_of(md: str) -> str:
@@ -266,20 +278,42 @@ def _rotated(rect: pymupdf.Rect, page: pymupdf.Page) -> Box:
     return Box(rect.x0, rect.y0, rect.x1, rect.y1)
 
 
-def span_style(span: dict) -> tuple[bool, bool, bool]:
-    """(bold, italic, mono) from the font name and flags."""
+def span_style(span: dict, size: float, baseline: float) -> tuple[bool, bool, bool, str]:
+    """(bold, italic, mono, script) from the font name, flags and position.
+
+    ``script`` is "sup" or "sub" for small text raised above or dropped below
+    the line's baseline, else "".
+    """
     f, fl = span["font"].lower(), span["flags"]
     bold = bool(fl & 16) or any(k in f for k in ("bold", "demi", "black", "heavy"))
     italic = bool(fl & 2) or "italic" in f or "oblique" in f
     mono = bool(fl & 8) or any(k in f for k in ("mono", "courier", "typewriter", "consol"))
-    return bold, italic, mono
+    script = ""
+    if span["size"] <= 0.85 * size:
+        y = span["origin"][1]
+        if y < baseline - 0.2 * size:
+            script = "sup"
+        elif y > baseline + 0.1 * size:
+            script = "sub"
+    return bold, italic, mono, script
 
 
 def styled_md(groups: list[list]) -> str:
-    out = []
-    for text, (bold, italic, mono) in groups:
+    """Markdown for a line's style groups: emphasis, code, ^sup^ and ~sub~."""
+    out: list[str] = []
+    run: list[str] | None = None  # [script, text] of an open ^...^ / ~...~ run
+
+    def close_run():
+        nonlocal run
+        if run:
+            mark = "^" if run[0] == "sup" else "~"
+            out.append(mark + run[1].replace(" ", "\\ ") + mark)  # pandoc needs escaped spaces
+        run = None
+
+    for text, (bold, italic, mono, script) in groups:
         core = text.strip()
         if not core:
+            close_run()
             out.append(text)
             continue
         lead, trail = text[: len(text) - len(text.lstrip())], text[len(text.rstrip()) :]
@@ -295,7 +329,19 @@ def styled_md(groups: list[list]) -> str:
                 s = f"**{s}**"
             elif italic:
                 s = f"*{s}*"
-        out.append(lead + s + trail)
+        if script and run and run[0] == script and not lead:
+            run[1] += s  # adjacent pieces of one sub/superscript in different fonts
+        else:
+            close_run()
+            out.append(lead)
+            if script:
+                run = [script, s]
+            else:
+                out.append(s)
+        if trail:
+            close_run()
+            out.append(trail)
+    close_run()
     return "".join(out)
 
 
@@ -308,12 +354,18 @@ def text_layer_lines(page: pymupdf.Page) -> list[Line]:
                 continue
             groups: list[list] = []
             sizes: Counter[float] = Counter()
+            for s in ln["spans"]:
+                sizes[round(s["size"], 1)] += len(s["text"].strip())
+            if not sizes or not sum(sizes.values()):
+                continue
+            main_size = sizes.most_common(1)[0][0]
+            baseline = statistics.median(s["origin"][1] for s in ln["spans"] if s["size"] >= 0.9 * main_size)
             prev_x1 = None
             for s in ln["spans"]:
                 t = clean_text(s["text"])
                 if not t:
                     continue
-                style = span_style(s)
+                style = span_style(s, main_size, baseline)
                 if not t.strip() and groups:
                     style = groups[-1][1]
                 if (
@@ -327,7 +379,6 @@ def text_layer_lines(page: pymupdf.Page) -> list[Line]:
                     groups[-1][0] += t
                 else:
                     groups.append([t, style])
-                sizes[round(s["size"], 1)] += len(t.strip())
                 prev_x1 = s["bbox"][2]
             text = "".join(g[0] for g in groups).strip()
             if not text:
@@ -339,7 +390,7 @@ def text_layer_lines(page: pymupdf.Page) -> list[Line]:
                     1.0,
                     _rotated(pymupdf.Rect(ln["bbox"]), page),
                     md=styled_md(groups).strip(),
-                    size=sizes.most_common(1)[0][0],
+                    size=main_size,
                     bold=all(g[1][0] for g in inked),
                     mono=all(g[1][2] for g in inked),
                 )
@@ -488,7 +539,8 @@ def find_decorations(doc: pymupdf.Document) -> set[tuple]:
     """Image positions repeated on many pages: banners, watermarks, ornaments."""
     counts: Counter[tuple] = Counter()
     for page in doc:
-        counts.update({_image_key(b) for b in embedded_image_boxes(page)})
+        small = 0.3 * page.rect.width * page.rect.height  # not page-sized scans or backgrounds
+        counts.update({_image_key(b) for b in embedded_image_boxes(page) if b.area < small})
     return {k for k, n in counts.items() if n >= max(3, doc.page_count // 50)}
 
 
@@ -715,36 +767,134 @@ def absorb_labels(figs: list[Box], lines: list[Line], smalls: list[Box], gap: fl
 
 
 # --------------------------------------------------------------------------
+# Markdown tables
+# --------------------------------------------------------------------------
+
+
+def markdown_table(lines: list[Line], med_h: float) -> str | None:
+    """A pipe table for a text table whose cells line up in clear columns.
+
+    Returns None when the layout is irregular (a body line straddling two
+    columns, too many columns); the caller then saves the table as an image.
+    """
+    rows = group_rows(lines)
+    if len(rows) < 2:
+        return None
+
+    # Columns are the x-ranges separated by whitespace in every row.
+    spans = sorted((ln.box.x0, ln.box.x1) for ln in lines)
+    cols = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s - cols[-1][1] >= 0.8 * med_h:
+            cols.append([s, e])
+        else:
+            cols[-1][1] = max(cols[-1][1], e)
+    if not 2 <= len(cols) <= 10:
+        return None
+
+    def column(b: Box) -> int:
+        return min(range(len(cols)), key=lambda k: 0 if cols[k][0] <= b.cx <= cols[k][1] else
+                   min(abs(b.cx - cols[k][0]), abs(b.cx - cols[k][1])))
+
+    grid: list[list[str]] = []
+    for n, r in enumerate(rows):
+        row = [""] * len(cols)
+        for ln in r:
+            i = column(ln.box)
+            straddles = sum(ln.box.x0 < e - med_h and ln.box.x1 > s + med_h for s, e in cols) > 1
+            if straddles and n > 0:
+                return None  # a merged cell in the body: not a simple grid
+            text = ln.md.replace("|", "\\|")
+            if not row[i] and ln.box.x0 - cols[i][0] > med_h and i == 0:
+                text = "\u00a0" * 4 + text  # indented row label
+            row[i] = (row[i] + " " + text).strip() if row[i] else text
+        if grid and not row[0] and sum(bool(x) for x in row) == 1:
+            k = next(i for i, x in enumerate(row) if x)
+            grid[-1][k] = (grid[-1][k] + " " + row[k]).strip()  # wrapped cell text
+            continue
+        grid.append(row)
+
+    def numeric(s: str) -> bool:
+        return bool(re.fullmatch(r"[-+−–]?[\d.,]+%?", plain_of(s).strip()))
+
+    align = []
+    for i in range(len(cols)):
+        body = [r[i] for r in grid[1:] if r[i]]
+        align.append("---:" if body and sum(map(numeric, body)) >= 0.7 * len(body) else "---")
+    out = ["| " + " | ".join(grid[0]) + " |", "|" + "|".join(align) + "|"]
+    out += ["| " + " | ".join(r) + " |" for r in grid[1:]]
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# OCR cache
+# --------------------------------------------------------------------------
+
+
+def page_fingerprint(page: pymupdf.Page, args: argparse.Namespace) -> str:
+    """Identify what a page looks like: its content, images, fonts and OCR settings."""
+    doc = page.parent
+    h = hashlib.sha256(page.read_contents())
+    xrefs = [img[0] for img in page.get_images(full=True)] + [f[0] for f in page.get_fonts(full=True)]
+    for xref in xrefs:
+        try:
+            h.update(doc.xref_stream_raw(xref) or b"")
+        except Exception:
+            pass
+    h.update(json.dumps([page.rotation, round(page.rect.width, 1), round(page.rect.height, 1),
+                         args.dpi, args.lang, args.fast]).encode())
+    return h.hexdigest()[:32]
+
+
+def ocr_cached(png: bytes, width: float, height: float, args: argparse.Namespace, key: str | None) -> list[Line]:
+    """Vision OCR, reusing a cached result for an identical page."""
+    path = args.cache_dir / f"{key}.json" if args.cache_dir and key else None
+    if path and path.exists():
+        return [Line(t, c, Box(*b)) for t, c, b in json.loads(path.read_text())]
+    if args.cache_only:
+        raise RuntimeError(f"OCR cache miss ({key}) and --cache-only was given")
+    with objc.autorelease_pool():
+        lines = ocr_image(png, width, height, args.lang, args.fast)
+    if path and lines:  # an empty result may be Vision failing silently: don't keep it
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = [[ln.text, ln.conf, [ln.box.x0, ln.box.y0, ln.box.x1, ln.box.y1]] for ln in lines]
+        path.write_text(json.dumps(data, ensure_ascii=False))
+    return lines
+
+
+# --------------------------------------------------------------------------
 # Pass 1: text, figures and tables per page
 # --------------------------------------------------------------------------
 
 
-def process_page(
-    page: pymupdf.Page,
-    args: argparse.Namespace,
-    image_dir: Path,
-    image_prefix: str,
-    decorations: set[tuple],
-) -> PageData:
+@dataclass
+class PagePrep:
+    """A page between rendering (main thread) and finishing (after OCR)."""
+
+    page: pymupdf.Page
+    pd: PageData
+    lines: list[Line]
+    images: list[Box]
+    decor: list[Box]
+    big_image: bool
+    pix: pymupdf.Pixmap | None = None
+    png: bytes | None = None
+    key: str | None = None
+
+    def get_pix(self, dpi: int) -> pymupdf.Pixmap:
+        if self.pix is None:
+            self.pix = self.page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
+        return self.pix
+
+
+def prepare_page(page: pymupdf.Page, args: argparse.Namespace, decorations: set[tuple]) -> PagePrep:
+    """Choose text layer or OCR for a page; render it if OCR is needed."""
     pw, ph = page.rect.width, page.rect.height
-    page_area = pw * ph
     pd = PageData(page.number + 1, pw, ph)
-
-    pix_cache: list = []
-
-    def get_pix() -> pymupdf.Pixmap:
-        if not pix_cache:
-            pix_cache.append(page.get_pixmap(dpi=args.dpi, colorspace=pymupdf.csRGB, alpha=False))
-        return pix_cache[0]
-
-    def get_img() -> Image.Image:
-        pix = get_pix()
-        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-
     all_images = embedded_image_boxes(page)
     decor = [b for b in all_images if _image_key(b) in decorations]
     images = [b for b in all_images if _image_key(b) not in decorations]
-    big_image = any(b.area >= 0.85 * page_area for b in images)
+    big_image = any(b.area >= 0.85 * pw * ph for b in images)
 
     # Use the text layer unless it is unusable, or it is the invisible layer
     # another OCR program put over a scan (then Vision redoes it).
@@ -755,31 +905,68 @@ def process_page(
             pd.source = "text" if lines else "ocr"
         elif usable_text(lines, 0.25 if args.doc_text_ok else 0.5) and not (big_image and invisible_text(page)):
             pd.source = "text"
-    scanned = big_image and pd.source == "ocr"
+    prep = PagePrep(page, pd, lines if pd.source == "text" else [], images, decor, big_image)
     if pd.source == "ocr":
-        lines = ocr_image(get_pix().tobytes("png"), pw, ph, args.lang, args.fast)
-        lines = drop_phantom_lines([ln for ln in lines if ln.conf >= args.min_confidence])
-    lines = [ln for ln in lines if not any(d.expand(2).contains_point(ln.box.cx, ln.box.cy) for d in decor)]
+        prep.png = prep.get_pix(args.dpi).tobytes("png")
+        prep.key = page_fingerprint(page, args)
+    return prep
+
+
+def finish_page(
+    prep: PagePrep,
+    ocr_lines: list[Line] | None,
+    args: argparse.Namespace,
+    image_dir: Path,
+    image_prefix: str,
+) -> PageData:
+    """Find figures and tables, crop them, and keep the remaining text."""
+    page, pd = prep.page, prep.pd
+    pw, ph = pd.width, pd.height
+    page_area = pw * ph
+
+    def get_img() -> Image.Image:
+        pix = prep.get_pix(args.dpi)
+        return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    scanned = prep.big_image and pd.source == "ocr"
+    lines = prep.lines
+    if ocr_lines is not None:
+        lines = drop_phantom_lines([ln for ln in ocr_lines if ln.conf >= args.min_confidence])
+    lines = [ln for ln in lines if not any(d.expand(2).contains_point(ln.box.cx, ln.box.cy) for d in prep.decor)]
 
     if not args.keep_contents and is_contents_page(lines, page.number, page.parent.page_count):
         pd.source = "skipped"
+        return pd
+    # Without an "Index" bookmark, an "Index" title near the end starts the index.
+    if not args.keep_index and not args.index_pages and is_index_start(lines, page.number, page.parent.page_count):
+        args.index_open = True
+    if args.index_open:
+        pd.source = "index"
         return pd
 
     med_h = statistics.median([ln.box.h for ln in lines]) if lines else 10.0
     long_lines = [ln.box.w for ln in lines if len(ln.text) >= 40]
     text_w = statistics.median(long_lines) if long_lines else 0.7 * pw
 
-    boxes = [] if args.figures == "none" else find_figures(page, get_img, lines, args.figures, images, scanned)
-    if args.tables == "image":
-        boxes += find_text_tables([ln for ln in lines if not ln.mono], med_h, text_w)
+    boxes = [] if args.figures == "none" else find_figures(page, get_img, lines, args.figures, prep.images, scanned)
+    if args.tables != "text":
+        for tb in find_text_tables([ln for ln in lines if not ln.mono], med_h, text_w):
+            inside = [ln for ln in lines if tb.contains_point(ln.box.cx, ln.box.cy)]
+            md = None
+            if args.tables == "markdown" or (args.tables == "auto" and pd.source == "text"):
+                md = markdown_table(inside, med_h)
+            if md:
+                pd.tables.append(Table(tb, md))
+            else:
+                boxes.append(tb)
     boxes = merge_boxes(boxes, gap=0.01 * min(pw, ph))
-    smalls = [b for b in images if b.area < 0.004 * page_area]
+    smalls = [b for b in prep.images if b.area < 0.004 * page_area]
     boxes = absorb_labels(boxes, lines, smalls, gap=1.2 * med_h)
     boxes = [b.expand(0.004 * min(pw, ph)) for b in boxes]
     boxes.sort(key=lambda b: (b.y0, b.x0))
 
     if boxes:
-        pix = get_pix()
+        pix = prep.get_pix(args.dpi)
         img = get_img()
         kx, ky = pix.width / pw, pix.height / ph
     for i, fb in enumerate(boxes, 1):
@@ -801,13 +988,34 @@ def process_page(
             ref = f"{image_prefix}/{name}"
         pd.figures.append(Figure(fb, ref))
 
-    # Text inside a figure (axis labels, text in photos) belongs to the figure.
+    # Text inside a figure or table (axis labels, cells) is part of it.
+    regions = [f.box for f in pd.figures] + [t.box for t in pd.tables]
     if not args.keep_figure_text:
-        lines = [
-            ln for ln in lines if not any(f.box.contains_point(ln.box.cx, ln.box.cy) for f in pd.figures)
-        ]
+        lines = [ln for ln in lines if not any(r.contains_point(ln.box.cx, ln.box.cy) for r in regions)]
     pd.lines = lines
+    prep.pix = prep.png = None  # free memory
     return pd
+
+
+INDEX_TITLE = re.compile(r"^(general |subject )?index$", re.IGNORECASE)
+
+
+def is_index_start(lines: list[Line], index: int, page_count: int) -> bool:
+    """A page near the end of the book that opens with the title "Index"."""
+    if index < 0.75 * page_count:
+        return False
+    top = sorted(lines, key=lambda ln: ln.box.y0)[:3]
+    return any(INDEX_TITLE.match(ln.text.strip()) for ln in top)
+
+
+def index_pages_from_toc(toc: list[list], page_count: int) -> set[int]:
+    """Pages covered by an "Index" bookmark, up to the next bookmark at its level."""
+    pages: set[int] = set()
+    for i, (lvl, title, pg) in enumerate(toc):
+        if INDEX_TITLE.match(title.strip()):
+            end = next((p for lv, _t, p in toc[i + 1 :] if lv <= lvl and p > pg), page_count + 1)
+            pages.update(range(pg, end))
+    return pages
 
 
 # --------------------------------------------------------------------------
@@ -851,6 +1059,7 @@ class Item:
     line: Line | None = None
     figure: Figure | None = None
     code: str | None = None
+    table: Table | None = None
     col: Box | None = None  # extent of the column the item was placed in
 
 
@@ -963,13 +1172,15 @@ CHAPTER_RE = re.compile(r"^(chapter|part|appendix|book|lecture)\s+(\d+|[ivxlcdm]
 
 @dataclass
 class Block:
-    kind: str  # "para", "heading", "list", "figure", "code"
-    text: str = ""  # Markdown
+    kind: str  # "para", "heading", "list", "figure", "table", "code", "footnote"
+    text: str = ""  # Markdown (the image path for figures)
     level: int = 0  # heading level; 0 = minor heading, level decided later
     page: int = 0
     x0: float = 0.0  # left edge of the first line
     nlines: int = 0
     hanging: bool = False
+    caption: str = ""  # figures and tables
+    ident: str = ""  # anchor id for cross-references
 
 
 @dataclass
@@ -1034,7 +1245,7 @@ def heading_candidate(ordered: list[Item], idx: int, m: Metrics) -> int | None:
 def build_blocks(p: PageData, m: Metrics) -> list[Block]:
     code = code_items(p.lines)
     items = [Item(ln.box, line=ln) for ln in p.lines if not ln.mono]
-    items += [Item(f.box, figure=f) for f in p.figures] + code
+    items += [Item(f.box, figure=f) for f in p.figures] + [Item(t.box, table=t) for t in p.tables] + code
     if not items:
         return []
     ordered = xy_cut(items, min_gx=max(0.012 * p.width, 0.6 * m.body_h), min_gy=0.5 * m.body_h)
@@ -1050,10 +1261,12 @@ def build_blocks(p: PageData, m: Metrics) -> list[Block]:
         cur = None
 
     for idx, it in enumerate(ordered):
-        if it.figure or it.code is not None:
+        if not it.line:
             flush()
             if it.figure:
                 blocks.append(Block("figure", it.figure.path, page=p.number))
+            elif it.table:
+                blocks.append(Block("table", it.table.md, page=p.number))
             else:
                 blocks.append(Block("code", it.code, page=p.number))
             prev = None
@@ -1092,7 +1305,7 @@ def build_blocks(p: PageData, m: Metrics) -> list[Block]:
             indent = m.body_h * 0.8
             if b.y0 < pb.y0 - 0.5 * m.body_h or prev.col != it.col:
                 new_para = not continues(cur.text, text)  # column or page region change
-            elif b.y0 - pb.y1 > 0.75 * m.body_h:
+            elif b.y0 - pb.y1 > 0.5 * m.body_h:
                 new_para = True
             elif cur.kind == "list":
                 new_para = b.x0 < cur.x0 - 0.5 * m.body_h
@@ -1200,6 +1413,151 @@ def apply_headings(per_page: list[list[Block]], toc: list[list]) -> None:
 
 
 # --------------------------------------------------------------------------
+# Footnotes
+# --------------------------------------------------------------------------
+
+FOOTNOTE_START = re.compile(r"^\^(\d{1,3}|\\\*|[†‡§¶])\^\s*|^(\d{1,3}|\\\*|[†‡§¶])\s+")
+
+
+def extract_footnotes(p: PageData, m: Metrics) -> dict[str, str]:
+    """Take footnotes off the bottom of a text-layer page.
+
+    Footnotes are small-print lines at the foot of the page, each starting
+    with a marker that also appears as a superscript in the body text. They
+    are only taken when every marker is found, so a caption or small print
+    is never mistaken for one.
+    """
+    if not m.body_size:
+        return {}
+    ls = sorted(p.lines, key=lambda ln: ln.box.y0)
+    i = len(ls)
+    while i > 0 and ls[i - 1].size and ls[i - 1].size <= 0.9 * m.body_size and ls[i - 1].box.y0 > 0.5 * p.height:
+        i -= 1
+    while i < len(ls) and not FOOTNOTE_START.match(ls[i].md):
+        i += 1
+    zone, body = ls[i:], ls[:i]
+    if not zone:
+        return {}
+    notes: list[list[str]] = []
+    for ln in zone:
+        mm = FOOTNOTE_START.match(ln.md)
+        if mm:
+            notes.append([mm.group(1) or mm.group(2), ln.md[mm.end() :]])
+        else:
+            notes[-1][1] = join_text(notes[-1][1], ln.md)
+    body_md = " ".join(ln.md for ln in body)
+    if not all(f"^{mk}^" in body_md for mk, _ in notes):
+        return {}
+    zone_ids = {id(ln) for ln in zone}
+    p.lines = [ln for ln in p.lines if id(ln) not in zone_ids]
+    return dict(notes)
+
+
+def link_footnotes(blocks: list[Block], notes: dict[str, str], page: int) -> list[Block]:
+    """Turn ^marker^ in the page's text into footnote references; return the notes."""
+    out = []
+    for k, (marker, text) in enumerate(notes.items(), 1):
+        label = f"p{page}-{k}"
+        for b in blocks:
+            if b.kind in ("para", "list", "heading") and f"^{marker}^" in b.text:
+                b.text = b.text.replace(f"^{marker}^", f"[^{label}]", 1)
+                out.append(Block("footnote", f"[^{label}]: {text}", page=page))
+                break
+    return out
+
+
+# --------------------------------------------------------------------------
+# Captions, anchors and cross-references
+# --------------------------------------------------------------------------
+
+REF_KINDS = {"fig": "fig", "figure": "fig", "table": "tab", "plate": "plate", "chart": "fig", "scheme": "fig",
+             "exhibit": "fig", "chapter": "chap", "section": "sec"}
+CAPTION_ID_RE = re.compile(r"^(fig(?:ure)?|table|plate|chart|scheme|exhibit)\.?\s*(\d+(?:\.\d+)*[a-z]?)", re.IGNORECASE)
+REF_RE = re.compile(r"\b(fig(?:ure)?s?\.?|tables?|plates?|chapters?|sections?)(\s+)(\d+(?:\.\d+)*)", re.IGNORECASE)
+
+
+def ref_id(word: str, number: str) -> str:
+    kind = REF_KINDS.get(word.lower().rstrip(".").rstrip("s"), "")
+    if not kind and word.lower().startswith("fig"):
+        kind = "fig"
+    return f"{kind}-{number.replace('.', '-')}" if kind else ""
+
+
+def attach_captions(blocks: list[Block]) -> None:
+    """Move "Figure 3.9: ..." paragraphs into the figure or table they caption.
+
+    Captions usually follow the figure; a "Table ..." caption may also come
+    just before its table.
+    """
+    out: list[Block] = []
+    i = 0
+    while i < len(blocks):
+        b = blocks[i]
+        if b.kind in ("figure", "table"):
+            nxt = blocks[i + 1] if i + 1 < len(blocks) else None
+            prv = out[-1] if out else None
+            if nxt and nxt.kind == "para" and CAPTION_RE.match(plain_of(nxt.text).strip()):
+                b.caption = nxt.text
+                i += 1
+            elif (
+                prv
+                and prv.kind == "para"
+                and not prv.caption
+                and re.match(r"^table\b", plain_of(prv.text).strip(), re.IGNORECASE)
+                and CAPTION_RE.match(plain_of(prv.text).strip())
+            ):
+                b.caption = out.pop().text
+        out.append(b)
+        i += 1
+    blocks[:] = out
+
+
+def assign_ids(blocks: list[Block]) -> None:
+    """Give captioned figures/tables and numbered headings anchor ids."""
+    seen: set[str] = set()
+    for b in blocks:
+        ident = ""
+        if b.kind in ("figure", "table") and b.caption:
+            m = CAPTION_ID_RE.match(plain_of(b.caption).strip())
+            ident = ref_id(m.group(1), m.group(2)) if m else ""
+        elif b.kind == "heading":
+            t = plain_of(b.text).strip()
+            m = re.match(r"^chapter\s+(\d+)\b", t, re.IGNORECASE) or (
+                re.match(r"^(\d+)\.?\s+\D", t) if b.level == 1 else None
+            )
+            if m:
+                ident = f"chap-{m.group(1)}"
+            elif m := re.match(r"^(\d+(?:\.\d+)+)\.?\s", t):
+                ident = f"sec-{m.group(1).replace('.', '-')}"
+        if ident and ident not in seen:
+            b.ident = ident
+            seen.add(ident)
+
+
+def link_references(blocks: list[Block]) -> None:
+    """Link "figure 3.9", "table 2.1", "chapter 4", "section 2.1" to their targets."""
+    targets = {b.ident for b in blocks if b.ident}
+
+    def link(text: str, own: str) -> str:
+        parts = re.split(r"(`[^`]*`)", text)  # leave code spans alone
+        for i in range(0, len(parts), 2):
+            def sub(m: re.Match) -> str:
+                ident = ref_id(m.group(1), m.group(3))
+                if ident in targets and ident != own:
+                    return f"[{m.group(0)}](#{ident})"
+                return m.group(0)
+
+            parts[i] = REF_RE.sub(sub, parts[i])
+        return "".join(parts)
+
+    for b in blocks:
+        if b.kind in ("para", "list"):
+            b.text = link(b.text, "")
+        elif b.caption:
+            b.caption = link(b.caption, b.ident)
+
+
+# --------------------------------------------------------------------------
 # Markdown output
 # --------------------------------------------------------------------------
 
@@ -1218,9 +1576,19 @@ def render_markdown(blocks: list[Block], page_markers: bool, front_matter: dict[
             prev_kind = None
         last_page = b.page
         if b.kind == "heading":
-            out.append(f"{'#' * max(1, b.level)} {b.text}\n")
+            attr = f" {{#{b.ident}}}" if b.ident else ""
+            out.append(f"{'#' * max(1, b.level)} {b.text}{attr}\n")
         elif b.kind == "figure":
-            out.append(f"![]({b.text})\n")
+            attr = f"{{#{b.ident}}}" if b.ident else ""
+            out.append(f"![{b.caption}]({b.text}){attr}\n")
+        elif b.kind == "table":
+            if b.ident:
+                out.append(f"[]{{#{b.ident}}}\n")
+            out.append(b.text + "\n")
+            if b.caption:
+                out.append(f"Table: {b.caption}\n")
+        elif b.kind == "footnote":
+            out.append(b.text + "\n")
         elif b.kind == "code":
             fence = "~~~" if "```" in b.text else "```"
             out.append(f"{fence}\n{b.text}\n{fence}\n")
@@ -1251,7 +1619,7 @@ def stitch_pages(per_page: list[list[Block]]) -> list[Block]:
         last = out[-1] if out else None
         if last and last.kind in ("para", "list"):
             lead_figs = []
-            while blocks and blocks[0].kind == "figure":
+            while blocks and blocks[0].kind in ("figure", "table"):
                 lead_figs.append(blocks.pop(0))
             if blocks and blocks[0].kind == "para" and continues(last.text, blocks[0].text):
                 last.text = join_text(last.text, blocks.pop(0).text)
@@ -1317,10 +1685,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--tables",
-        choices=["image", "text"],
-        default="image",
-        help="tables set as text: save them as images (default) or leave them as text",
+        choices=["auto", "markdown", "image", "text"],
+        default="auto",
+        help="tables set as text: auto = Markdown tables from the text layer when the columns are clear, "
+        "otherwise images (default); markdown = also try OCR'd tables; image = always images; text = leave as text",
     )
+    ap.add_argument("--keep-index", action="store_true", help="keep the book's index (dropped by default)")
+    ap.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1), help="parallel OCR jobs (default 4)")
+    ap.add_argument("--cache-dir", type=Path, help="OCR cache directory (default: <outdir>/.ocr-cache)")
+    ap.add_argument("--no-cache", action="store_true", help="do not read or write the OCR cache")
+    ap.add_argument("--cache-only", action="store_true", help=argparse.SUPPRESS)  # tests: never call Vision
+    ap.add_argument("--epub", action="store_true", help="also build an EPUB with pandoc")
+    ap.add_argument("--cover", type=int, default=1, help="page rendered as the EPUB cover (0 = none; default 1)")
     ap.add_argument("--no-outline", action="store_true", help="ignore the PDF's bookmarks when finding headings")
     ap.add_argument("--keep-contents", action="store_true", help="keep table-of-contents pages")
     ap.add_argument("--keep-figure-text", action="store_true", help="also emit text found inside figures")
@@ -1349,21 +1725,54 @@ def main(argv: list[str] | None = None) -> int:
 
     decorations = find_decorations(doc)
     args.doc_text_ok = args.text_layer != "never" and document_text_ok(doc)
+    args.cache_dir = None if args.no_cache else (args.cache_dir or outdir / ".ocr-cache")
+    toc = [] if args.no_outline else doc.get_toc()
+    args.index_pages = set() if args.keep_index else index_pages_from_toc(doc.get_toc(), doc.page_count)
+    args.index_open = False
     page_numbers = parse_pages(args.pages, doc.page_count)
+
+    # Pages are rendered and finished in order on this thread (PyMuPDF is not
+    # thread-safe); Vision OCR runs for several pages at once in a pool.
     pages: list[PageData] = []
-    for k, pno in enumerate(page_numbers, 1):
-        print(f"\rPage {pno + 1} ({k}/{len(page_numbers)})", end="", file=sys.stderr, flush=True)
+    pending: deque = deque()
+
+    def finish_one():
+        prep, fut = pending.popleft()
+        if isinstance(prep, PageData):
+            pages.append(prep)
+            return
+        ocr = fut.result() if fut else None
         with objc.autorelease_pool():
-            pages.append(process_page(doc[pno], args, image_dir, "images", decorations))
+            pages.append(finish_page(prep, ocr, args, image_dir, "images"))
+        print(f"\rPage {prep.pd.number} ({len(pages)}/{len(page_numbers)})", end="", file=sys.stderr, flush=True)
+
+    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        for pno in page_numbers:
+            page = doc[pno]
+            if pno + 1 in args.index_pages:
+                pending.append((PageData(pno + 1, page.rect.width, page.rect.height, source="index"), None))
+            else:
+                with objc.autorelease_pool():
+                    prep = prepare_page(page, args, decorations)
+                fut = None
+                if prep.png is not None:
+                    fut = pool.submit(ocr_cached, prep.png, prep.pd.width, prep.pd.height, args, prep.key)
+                pending.append((prep, fut))
+            while pending and (len(pending) > 2 * max(1, args.jobs) or pending[0][1] is None):
+                finish_one()
+        while pending:
+            finish_one()
     print(file=sys.stderr)
 
     used = Counter(p.source for p in pages)
+    skipped = ", ".join(str(p.number) for p in pages if p.source == "skipped")
     print(
-        f"{used['text']} pages from the text layer, {used['ocr']} by OCR, {used['skipped']} contents pages "
-        f"skipped{': ' + ', '.join(str(p.number) for p in pages if p.source == 'skipped') if used['skipped'] else ''}",
+        f"{used['text']} pages from the text layer, {used['ocr']} by OCR, "
+        f"{used['skipped']} contents pages skipped{': ' + skipped if skipped else ''}, "
+        f"{used['index']} index pages dropped",
         file=sys.stderr,
     )
-    pages = [p for p in pages if p.source != "skipped"]
+    pages = [p for p in pages if p.source in ("text", "ocr")]
 
     if not args.keep_headers:
         remove_running_heads(pages)
@@ -1373,9 +1782,19 @@ def main(argv: list[str] | None = None) -> int:
     sizes = [ln.size for ln in all_lines if ln.size and len(ln.text) >= 20]
     metrics = Metrics(statistics.median(heights), statistics.median(sizes) if sizes else None)
 
-    per_page = [build_blocks(p, metrics) for p in pages]
-    apply_headings(per_page, [] if args.no_outline else doc.get_toc())
+    per_page, notes = [], []
+    for p in pages:
+        page_notes = extract_footnotes(p, metrics)
+        blocks = build_blocks(p, metrics)
+        notes += link_footnotes(blocks, page_notes, p.number)
+        per_page.append(blocks)
+    apply_headings(per_page, toc)
+    for blocks in per_page:
+        attach_captions(blocks)
     blocks = stitch_pages(per_page)
+    assign_ids(blocks)
+    link_references(blocks)
+    blocks += notes
 
     front = {}
     if not args.no_front_matter:
@@ -1388,8 +1807,32 @@ def main(argv: list[str] | None = None) -> int:
     md_path = outdir / f"{args.pdf.stem}.md"
     md_path.write_text(render_markdown(blocks, args.page_markers, front), encoding="utf-8")
     nfig = sum(len(p.figures) for p in pages)
-    print(f"Wrote {md_path} ({len(pages)} pages, {nfig} figures/tables)", file=sys.stderr)
+    ntab = sum(len(p.tables) for p in pages)
+    print(
+        f"Wrote {md_path} ({len(pages)} pages, {nfig} images, {ntab} Markdown tables, {len(notes)} footnotes)",
+        file=sys.stderr,
+    )
+
+    if args.epub:
+        return build_epub(doc, md_path, args)
     return 0
+
+
+def build_epub(doc: pymupdf.Document, md_path: Path, args: argparse.Namespace) -> int:
+    """Run pandoc (locally) on the Markdown, with a rendered page as the cover."""
+    pandoc = shutil.which("pandoc")
+    if not pandoc:
+        print("pandoc not found; install it (e.g. brew install pandoc) to use --epub", file=sys.stderr)
+        return 1
+    outdir = md_path.parent
+    cmd = [pandoc, md_path.name, "-o", md_path.with_suffix(".epub").name]
+    if 1 <= args.cover <= doc.page_count:
+        doc[args.cover - 1].get_pixmap(dpi=150).pil_save(outdir / "cover.jpg", quality=90)
+        cmd += ["--epub-cover-image", "cover.jpg"]
+    result = subprocess.run(cmd, cwd=outdir)
+    if result.returncode == 0:
+        print(f"Wrote {md_path.with_suffix('.epub')}", file=sys.stderr)
+    return result.returncode
 
 
 if __name__ == "__main__":
